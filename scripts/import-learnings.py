@@ -11,12 +11,12 @@ The date is preserved in `source` (and used as updated_at). The `[CATEGORY]`
 tag maps to a memory type; untagged bullets become `learning`.
 
 Idempotent: dedups by content hash, so re-runs and duplicated worktrees
-(e.g. media-service-DRP-384) collapse into a single memory.
+(e.g. two checkouts of the same repo) collapse into a single memory.
 
 Usage:
     import-learnings.py REPO_DIR [REPO_DIR ...]          # auto-finds .github/learnings.md
     import-learnings.py --file path/to/learnings.md --scope myrepo
-    import-learnings.py ~/IdeaProjects/media-service --dry-run
+    import-learnings.py ~/code/my-repo --dry-run
 """
 from __future__ import annotations
 

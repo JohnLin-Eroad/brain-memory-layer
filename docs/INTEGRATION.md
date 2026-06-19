@@ -80,38 +80,21 @@ back.
 
 ---
 
-## 6. Migrating from a legacy `brain-graph.db`
+## 6. Optional: bulk-import existing `learnings.md` files
 
-If you're coming from the older vault-derived graph (`nodes` / `edges` /
-`node_memory` / `node_access_log`), use the bundled importer — it preserves
-every node, edge, memory-state and access-log row, keeps original ids so edges
-stay valid, and stashes the old vault/domain/rel_path in `memories.source`:
-
-```bash
-python3 scripts/migrate-brain-graph.py --dry-run        # preview, writes nothing
-python3 scripts/migrate-brain-graph.py                  # ~/.copilot/brain-graph.db → ~/.brain/brain.db
-python3 scripts/migrate-brain-graph.py --skip-structural # drop folder_sibling edges
-```
-
-It verifies that the total body-character count is unchanged (a hard
-"no knowledge lost" assertion) and that every memory has a `memory_state` row.
-Re-running is idempotent. After migrating, archive the old DB/vaults and update
-your `copilot-instructions.md` to point only at the `brain` CLI.
-
-## 7. Migrating from a flat `learnings.md`
-
-A flat `learnings.md` (`- **[DATE]** [CATEGORY] text`) imports cleanly:
+If you already keep per-repo `.github/learnings.md` notes (the common Copilot
+pattern), you can bulk-load them into the brain with the bundled importer.
+This is optional — new users with no notes can skip it.
 
 ```bash
-grep -E '^\- ' .github/learnings.md \
-  | sed -E 's/^- \*\*\[[0-9-]+\]\*\* //' \
-  | while IFS= read -r line; do
-      brain learn "$line" --level repo --scope "$(basename "$PWD")" --source learnings.md
-    done
+python3 scripts/import-learnings.py --dry-run ~/code/my-repo   # preview
+python3 scripts/import-learnings.py ~/code/repo-a ~/code/repo-b
 ```
 
-`brain learn` parses the `[CATEGORY]` tag into the correct `type`; duplicates
-are deduped by content hash, so re-running is safe.
+Each bullet becomes a `repo`-level memory scoped to the repo directory name.
+It handles dated bullets (`- **[DATE]** [CATEGORY] text`), plain bullets, and
+bullets under `## DATE` headers; known `[CATEGORY]` tags map to the right
+`type`. Duplicates are deduped by content hash, so re-running is safe.
 
 ---
 

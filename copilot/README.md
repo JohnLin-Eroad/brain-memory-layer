@@ -42,7 +42,7 @@ cat copilot/copilot-instructions.snippet.md >> ~/.copilot/copilot-instructions.m
 
 ## Note on the snippet
 
-The snippet intentionally omits EROAD/company specifics so it's portable across
+The snippet intentionally omits company specifics so it's portable across
 teams. If your org has shared domains/scopes, document the canonical `--scope`
 names in your team template alongside the snippet — but keep the contract itself
 unchanged so every engineer's brain behaves identically.
