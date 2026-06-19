@@ -80,7 +80,25 @@ back.
 
 ---
 
-## 6. Migrating from legacy `learnings.md`
+## 6. Migrating from a legacy `brain-graph.db`
+
+If you're coming from the older vault-derived graph (`nodes` / `edges` /
+`node_memory` / `node_access_log`), use the bundled importer — it preserves
+every node, edge, memory-state and access-log row, keeps original ids so edges
+stay valid, and stashes the old vault/domain/rel_path in `memories.source`:
+
+```bash
+python3 scripts/migrate-brain-graph.py --dry-run        # preview, writes nothing
+python3 scripts/migrate-brain-graph.py                  # ~/.copilot/brain-graph.db → ~/.brain/brain.db
+python3 scripts/migrate-brain-graph.py --skip-structural # drop folder_sibling edges
+```
+
+It verifies that the total body-character count is unchanged (a hard
+"no knowledge lost" assertion) and that every memory has a `memory_state` row.
+Re-running is idempotent. After migrating, archive the old DB/vaults and update
+your `copilot-instructions.md` to point only at the `brain` CLI.
+
+## 7. Migrating from a flat `learnings.md`
 
 A flat `learnings.md` (`- **[DATE]** [CATEGORY] text`) imports cleanly:
 

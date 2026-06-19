@@ -100,6 +100,7 @@ brain-memory-layer/
 ├── docs/                 SPEC, MEMORY-MODEL, INTEGRATION, CONVENTIONS
 ├── skills/brain-sync/    Copilot skill (recall at start, capture at end)
 ├── copilot/              Copilot wiring: instructions snippet + optional agents
+├── scripts/              migrate-brain-graph.py (legacy brain-graph.db importer)
 └── tests/test_brain.sh   conformance / smoke test
 ```
 
