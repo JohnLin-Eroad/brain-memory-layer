@@ -94,12 +94,28 @@ Full math in [docs/MEMORY-MODEL.md](docs/MEMORY-MODEL.md).
 
 ```
 brain-memory-layer/
-├── install.sh            one-command bootstrap (idempotent)
+├── install.sh            one-command bootstrap (idempotent; --with-copilot)
 ├── bin/brain             the CLI (single-file, stdlib-only Python)
 ├── sql/schema.sql        canonical schema (also embedded in the CLI)
 ├── docs/                 SPEC, MEMORY-MODEL, INTEGRATION, CONVENTIONS
+├── skills/brain-sync/    Copilot skill (recall at start, capture at end)
+├── copilot/              Copilot wiring: instructions snippet + optional agents
 └── tests/test_brain.sh   conformance / smoke test
 ```
+
+---
+
+## Copilot CLI rollout
+
+```bash
+./install.sh --with-copilot
+```
+
+Installs the **brain-sync** skill, the optional `brain-data-retrieval` /
+`brain-consolidation` agents, and appends the required instructions block to
+`~/.copilot/copilot-instructions.md` (idempotent). A single-agent user needs
+only the skill + the instructions block; the two agents are for multi-agent
+pipelines. See [copilot/README.md](copilot/README.md).
 
 ---
 

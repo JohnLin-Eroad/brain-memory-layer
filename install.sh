@@ -15,6 +15,16 @@
 # ============================================================================
 set -euo pipefail
 
+WITH_COPILOT=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-copilot) WITH_COPILOT=1 ;;
+    -h|--help)
+      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
 PREFIX="${PREFIX:-$HOME/.local}"
 SHARE_DIR="$PREFIX/share/brain-memory-layer"
 BIN_DIR="$PREFIX/bin"
@@ -40,8 +50,8 @@ ok "sqlite3 + FTS5 available"
 # ---- 2. Install package files --------------------------------------------
 say "Installing package → $SHARE_DIR"
 mkdir -p "$SHARE_DIR" "$BIN_DIR"
-# Copy bin/ and sql/ (and docs for reference) preserving layout.
-for d in bin sql docs; do
+# Copy package contents preserving layout.
+for d in bin sql docs skills copilot; do
   if [ -d "$SRC_DIR/$d" ]; then
     rm -rf "${SHARE_DIR:?}/$d"
     cp -R "$SRC_DIR/$d" "$SHARE_DIR/$d"
@@ -68,7 +78,25 @@ case ":$PATH:" in
      printf '\n    export PATH="%s:$PATH"\n\n' "$BIN_DIR" ;;
 esac
 
-# ---- 6. Copilot integration hint -----------------------------------------
+# ---- 6. Optional: Copilot CLI assets -------------------------------------
+if [ "$WITH_COPILOT" -eq 1 ]; then
+  say "Installing Copilot integration assets → ~/.copilot"
+  mkdir -p "$HOME/.copilot/skills" "$HOME/.copilot/agents"
+  rm -rf "$HOME/.copilot/skills/brain-sync"
+  cp -R "$SRC_DIR/skills/brain-sync" "$HOME/.copilot/skills/brain-sync"
+  cp "$SRC_DIR/copilot/agents/"*.agent.md "$HOME/.copilot/agents/"
+  ok "Installed brain-sync skill + brain agents"
+
+  INSTR="$HOME/.copilot/copilot-instructions.md"
+  if [ -f "$INSTR" ] && grep -qF "## Memory layer (brain)" "$INSTR"; then
+    warn "copilot-instructions.md already has a '## Memory layer (brain)' block — leaving it untouched."
+  else
+    { printf '\n'; cat "$SRC_DIR/copilot/copilot-instructions.snippet.md"; } >> "$INSTR"
+    ok "Appended memory-layer block to $INSTR"
+  fi
+fi
+
+# ---- 7. Done --------------------------------------------------------------
 cat <<EOF
 
 $(ok "Brain Memory Layer installed.")
@@ -79,13 +107,18 @@ Quickstart:
     brain search "flyway"
     brain stats
 
-Copilot CLI integration (optional but recommended):
-    Add to ~/.copilot/copilot-instructions.md (or your team template):
-
-      ## Memory layer
-      - Task start: run \`brain search "<keywords>"\` to recall relevant memories.
-      - Task end:   run \`brain learn "[CATEGORY] <insight>"\` for durable learnings.
-      - Daily:      \`brain sleep\` (decay housekeeping). See docs/INTEGRATION.md.
+Copilot CLI integration:
+EOF
+if [ "$WITH_COPILOT" -eq 1 ]; then
+  echo "    ✅ Installed: brain-sync skill, brain agents, and the instructions block."
+  echo "       Restart your Copilot CLI session to pick them up."
+else
+  echo "    Run \`./install.sh --with-copilot\` to install the brain-sync skill,"
+  echo "    the optional brain agents, and append the required instructions block."
+  echo "    Or do it manually — see copilot/README.md."
+fi
+cat <<EOF
 
 Docs: $SHARE_DIR/docs/   (SPEC.md, MEMORY-MODEL.md, INTEGRATION.md, CONVENTIONS.md)
+Copilot assets: $SHARE_DIR/copilot/   +   skill at $SHARE_DIR/skills/brain-sync/
 EOF

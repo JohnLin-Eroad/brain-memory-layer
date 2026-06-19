@@ -7,22 +7,21 @@ a shell command can use it: Copilot CLI, editor agents, CI, git hooks, cron.
 
 ## 1. Copilot CLI (recommended)
 
-Add a short block to your `~/.copilot/copilot-instructions.md` (or the shared
-team template). Keep it tiny — the brain does the heavy lifting.
+The fastest path is the installer:
 
-```markdown
-## Memory layer (brain)
-- **Task start:** run `brain search "<keywords from the task>" --json` and read
-  the top results before planning. Respect `superseded`/`stale` flags.
-- **During:** when you discover something durable, capture it immediately:
-  `brain learn "[GOTCHA|PATTERN|DECISION|WORKFLOW|PREFERENCE|TOOL] <insight>" \
-    --level <repo|project|domain|global> [--scope <name>]`.
-- **Conflicts:** if new knowledge replaces old, `brain supersede <old> <new>`.
-- **Task end:** write 1–3 learnings. Don't duplicate across levels — link.
+```bash
+./install.sh --with-copilot
 ```
 
-That's the whole contract. No agent should read or write the SQLite file
-directly; always go through `brain`.
+This installs the **brain-sync** skill, the optional brain agents, and appends
+the required memory block to `~/.copilot/copilot-instructions.md`. The exact
+block is in [`../copilot/copilot-instructions.snippet.md`](../copilot/copilot-instructions.snippet.md);
+the skill detail is in [`../skills/brain-sync/SKILL.md`](../skills/brain-sync/SKILL.md).
+See [`../copilot/README.md`](../copilot/README.md) for required-vs-optional.
+
+The contract in one line: **search at task start, capture during, supersede on
+conflict, write learnings at task end** — all through the `brain` CLI. No agent
+should read or write the SQLite file directly.
 
 ---
 
