@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+"""brain — portable per-engineer memory layer CLI.
+
+Source of truth: a local SQLite database (default ~/.brain/brain.db).
+Stdlib only (sqlite3). No external services, no network, no extensions.
+
+Memory model (hippo-memory inspired):
+    effective_strength = strength * 0.5 ** (age_days / half_life_days)   (floored)
+    blended_score      = bm25 * (BLEND_BASE + BLEND_SLOPE * eff_strength)
+    superseded memories take a multiplicative penalty.
+    Every read reinforces: strength += bump, half_life *= growth.
+
+Commands:
+    init                          create / migrate the database
+    add                           add a memory
+    learn "[CATEGORY] text"       shortcut: parse a learning into a typed memory
+    search QUERY                  full-text search, decay-blended ranking
+    get ID                        show one memory (+ state + edges)
+    link SRC DST                  create a typed edge
+    traverse ID                   walk the graph from a memory
+    supersede OLD NEW             mark OLD superseded by NEW
+    confidence ID LEVEL           set verified|observed|inferred|stale
+    forget ID                     soft-delete (tombstone) a memory
+    sleep                         housekeeping: decay-mark stale + prune log
+    stats                         database summary
+    export DIR                    optional markdown export (vaults are optional)
+    doctor                        health / integrity check
+
+Run `brain <command> -h` for per-command options.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime, timezone
+
+# --------------------------------------------------------------------------- #
+# Constants — the recall model. Keep in sync with docs/MEMORY-MODEL.md.
+# --------------------------------------------------------------------------- #
+SCHEMA_VERSION = 1
+DECAY_FLOOR = 0.05
+SUPERSEDE_PENALTY = 0.25
+BLEND_BASE = 0.5
+BLEND_SLOPE = 0.5
+DEFAULT_HALF_LIFE = 7.0
+MAX_HALF_LIFE = 180.0
+HALF_LIFE_GROWTH = 1.05
+STALE_THRESHOLD = 0.10
+ACCESS_LOG_RETENTION_DAYS = 90
+BUMPS = {"search": 0.05, "traverse": 0.05, "fetch": 0.20}
+
+VALID_TYPES = ("note", "learning", "decision", "pattern",
+               "gotcha", "workflow", "preference", "tool", "entity")
+VALID_LEVELS = ("repo", "project", "domain", "global", "tooling")
+VALID_EDGE_TYPES = ("relates_to", "depends_on", "supersedes",
+                    "derived_from", "refines", "contradicts")
+VALID_CONFIDENCE = ("verified", "observed", "inferred", "stale")
+
+# Maps the [CATEGORY] tags used in learnings.md to memory types.
+CATEGORY_TO_TYPE = {
+    "PATTERN": "pattern", "GOTCHA": "gotcha", "DECISION": "decision",
+    "WORKFLOW": "workflow", "PREFERENCE": "preference", "TOOL": "tool",
+}
+
+SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "sql", "schema.sql")
+
+
+# --------------------------------------------------------------------------- #
+# Database helpers
+# --------------------------------------------------------------------------- #
+def db_path() -> str:
+    return os.environ.get("BRAIN_DB",
+                          os.path.join(os.path.expanduser("~"), ".brain", "brain.db"))
+
+
+def connect(create: bool = False) -> sqlite3.Connection:
+    path = db_path()
+    if not os.path.exists(path) and not create:
+        sys.exit(f"brain: database not found at {path}\n"
+                 f"       run `brain init` first (or set BRAIN_DB).")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def load_schema_sql() -> str:
+    # Prefer the packaged schema.sql; fall back to the embedded copy.
+    if os.path.exists(SCHEMA_PATH):
+        with open(SCHEMA_PATH, encoding="utf-8") as fh:
+            return fh.read()
+    return EMBEDDED_SCHEMA
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_str() -> str:
+    return now_utc().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_ts(ts: str) -> datetime:
+    if "T" in ts:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    else:
+        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def content_hash(title: str, body: str) -> str:
+    return hashlib.sha256(f"{title}\n{body}".encode("utf-8")).hexdigest()
+
+
+def hash_query(q: str) -> str:
+    return hashlib.sha1(q.encode("utf-8")).hexdigest()[:12]
+
+
+def slugify(text: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return s[:60].strip("-") or "memory"
+
+
+def resolve_id(conn, ref: str) -> str:
+    """Resolve an exact id, else a unique prefix/substring match. Exits on
+    ambiguity or no match. Lets humans/agents reference memories loosely."""
+    if conn.execute("SELECT 1 FROM memories WHERE id=?", (ref,)).fetchone():
+        return ref
+    rows = conn.execute(
+        "SELECT id FROM memories WHERE id LIKE ? OR id LIKE ? ORDER BY id",
+        (ref + "%", "%" + ref + "%")).fetchall()
+    uniq = sorted({r["id"] for r in rows})
+    if len(uniq) == 1:
+        return uniq[0]
+    if not uniq:
+        sys.exit(f"brain: no memory matching '{ref}'")
+    sys.exit("brain: ambiguous reference '{}' matches {} memories:\n  {}".format(
+        ref, len(uniq), "\n  ".join(uniq[:10])))
+
+
+def make_id(level: str, type_: str, title: str, scope: str | None) -> str:
+    parts = [level]
+    if scope:
+        parts.append(slugify(scope))
+    parts.extend([type_, slugify(title)])
+    return "/".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Recall model (pure functions)
+# --------------------------------------------------------------------------- #
+def effective_strength(strength, half_life_days, last_retrieved_at, now=None) -> float:
+    if strength is None:
+        return 1.0
+    if not last_retrieved_at:
+        return max(DECAY_FLOOR, min(1.0, strength))
+    hl = half_life_days or DEFAULT_HALF_LIFE
+    if hl <= 0:
+        return max(DECAY_FLOOR, min(1.0, strength))
+    now = now or now_utc()
+    age_days = max(0.0, (now - parse_ts(last_retrieved_at)).total_seconds() / 86400.0)
+    return max(DECAY_FLOOR, min(1.0, strength * math.pow(0.5, age_days / hl)))
+
+
+def blend_score(bm25: float, eff: float, superseded: bool = False) -> float:
+    factor = BLEND_BASE + BLEND_SLOPE * eff
+    if superseded:
+        factor *= SUPERSEDE_PENALTY
+    return bm25 * factor
+
+
+# --------------------------------------------------------------------------- #
+# Reinforcement
+# --------------------------------------------------------------------------- #
+def reinforce(conn, ids, source, now=None) -> None:
+    bump = BUMPS.get(source)
+    if not ids or bump is None:
+        return
+    now = now or now_utc()
+    rows = conn.execute(
+        f"SELECT memory_id, strength, half_life_days, last_retrieved_at "
+        f"FROM memory_state WHERE memory_id IN ({','.join('?' * len(ids))})",
+        ids,
+    ).fetchall()
+    updates = []
+    for r in rows:
+        decayed = effective_strength(r["strength"], r["half_life_days"],
+                                     r["last_retrieved_at"], now=now)
+        new_strength = min(1.0, decayed + bump)
+        new_hl = min(MAX_HALF_LIFE, (r["half_life_days"] or DEFAULT_HALF_LIFE) * HALF_LIFE_GROWTH)
+        updates.append((new_strength, new_hl, now_str(), r["memory_id"]))
+    if updates:
+        conn.executemany(
+            "UPDATE memory_state SET strength=?, half_life_days=?, "
+            "last_retrieved_at=?, retrieval_count=retrieval_count+1, "
+            "updated_at=datetime('now') WHERE memory_id=?", updates)
+
+
+def log_access(conn, ids, source, query_hash=None) -> None:
+    if not ids:
+        return
+    conn.executemany(
+        "INSERT INTO access_log (memory_id, source, query_hash) VALUES (?,?,?)",
+        [(i, source, query_hash) for i in ids])
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+def cmd_init(args):
+    conn = connect(create=True)
+    conn.executescript(load_schema_sql())
+    if args.owner:
+        conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('owner',?)",
+                     (args.owner,))
+    conn.commit()
+    ver = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    print(f"✅ brain initialised at {db_path()} (schema v{ver['value'] if ver else '?'})")
+
+
+def _insert_memory(conn, *, title, body, type_, level, scope, source,
+                   confidence, mem_id=None):
+    if type_ not in VALID_TYPES:
+        sys.exit(f"brain: invalid type '{type_}' (choose from {', '.join(VALID_TYPES)})")
+    if level not in VALID_LEVELS:
+        sys.exit(f"brain: invalid level '{level}' (choose from {', '.join(VALID_LEVELS)})")
+    if confidence and confidence not in VALID_CONFIDENCE:
+        sys.exit(f"brain: invalid confidence '{confidence}'")
+    mem_id = mem_id or make_id(level, type_, title, scope)
+    chash = content_hash(title, body)
+
+    dup = conn.execute("SELECT id FROM memories WHERE content_hash=? AND tombstone=0",
+                       (chash,)).fetchone()
+    if dup:
+        print(f"↩  duplicate content; existing memory: {dup['id']}")
+        return dup["id"]
+
+    existing = conn.execute("SELECT id FROM memories WHERE id=?", (mem_id,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE memories SET title=?, body=?, type=?, level=?, scope=?, "
+            "source=?, content_hash=?, updated_at=datetime('now'), tombstone=0 "
+            "WHERE id=?",
+            (title, body, type_, level, scope, source, chash, mem_id))
+        action = "updated"
+    else:
+        conn.execute(
+            "INSERT INTO memories (id,title,body,type,level,scope,source,content_hash) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (mem_id, title, body, type_, level, scope, source, chash))
+        conn.execute(
+            "INSERT INTO memory_state (memory_id, confidence) VALUES (?,?)",
+            (mem_id, confidence))
+        action = "added"
+    if confidence and action == "updated":
+        conn.execute("UPDATE memory_state SET confidence=?, updated_at=datetime('now') "
+                     "WHERE memory_id=?", (confidence, mem_id))
+    conn.commit()
+    print(f"✅ {action}: {mem_id}")
+    return mem_id
+
+
+def cmd_add(args):
+    conn = connect()
+    body = args.body or ""
+    if args.body == "-" or (not body and not sys.stdin.isatty()):
+        body = sys.stdin.read().strip()
+    _insert_memory(conn, title=args.title, body=body, type_=args.type,
+                   level=args.level, scope=args.scope, source=args.source,
+                   confidence=args.confidence, mem_id=args.id)
+
+
+def cmd_learn(args):
+    """Parse a learnings.md-style entry: '[CATEGORY] free text' into a memory."""
+    conn = connect()
+    text = args.text.strip()
+    m = re.match(r"^\[(\w+)\]\s*(.+)$", text, re.DOTALL)
+    type_ = "learning"
+    if m and m.group(1).upper() in CATEGORY_TO_TYPE:
+        type_ = CATEGORY_TO_TYPE[m.group(1).upper()]
+        text = m.group(2).strip()
+    title = text.split("\n", 1)[0][:80]
+    _insert_memory(conn, title=title, body=text, type_=type_,
+                   level=args.level, scope=args.scope, source=args.source or "learn",
+                   confidence=args.confidence)
+
+
+def cmd_search(args):
+    conn = connect()
+    qh = hash_query(args.query)
+    fts = fts_query(args.query)
+    where, params = ["m.tombstone=0"], []
+    if args.level:
+        where.append("m.level=?")
+        params.append(args.level)
+    if args.type:
+        where.append("m.type=?")
+        params.append(args.type)
+    if args.scope:
+        where.append("m.scope=?")
+        params.append(args.scope)
+
+    rows = conn.execute(
+        f"""
+        SELECT m.id, m.title, m.type, m.level, m.scope, m.body,
+               bm25(memories_fts) AS bm25,
+               s.strength, s.half_life_days, s.last_retrieved_at,
+               s.confidence, s.retrieval_count, s.superseded_by
+        FROM memories_fts
+        JOIN memories m ON m.rowid = memories_fts.rowid
+        LEFT JOIN memory_state s ON s.memory_id = m.id
+        WHERE memories_fts MATCH ? AND {' AND '.join(where)}
+        ORDER BY bm25
+        LIMIT ?
+        """,
+        [fts, *params, args.limit * 3],
+    ).fetchall()
+
+    now = now_utc()
+    hits = []
+    for r in rows:
+        # bm25() returns negative (lower = better); flip to positive relevance.
+        relevance = -r["bm25"]
+        eff = effective_strength(r["strength"], r["half_life_days"],
+                                 r["last_retrieved_at"], now=now)
+        superseded = r["superseded_by"] is not None
+        score = blend_score(relevance, eff, superseded)
+        hits.append({
+            "id": r["id"], "title": r["title"], "type": r["type"],
+            "level": r["level"], "scope": r["scope"],
+            "score": round(score, 4), "effective_strength": round(eff, 4),
+            "confidence": r["confidence"], "superseded_by": r["superseded_by"],
+            "snippet": (r["body"] or "")[:200],
+        })
+    hits.sort(key=lambda h: h["score"], reverse=True)
+    hits = hits[:args.limit]
+
+    ids = [h["id"] for h in hits]
+    if not args.no_reinforce:
+        log_access(conn, ids, "search", qh)
+        reinforce(conn, ids, "search", now=now)
+        conn.commit()
+
+    if args.json:
+        print(json.dumps(hits, indent=2))
+        return
+    if not hits:
+        print("(no matches)")
+        return
+    for i, h in enumerate(hits, 1):
+        flag = " ⚠superseded" if h["superseded_by"] else ""
+        conf = f" [{h['confidence']}]" if h["confidence"] else ""
+        print(f"{i:>2}. {h['id']}{conf}{flag}")
+        print(f"    {h['title']}")
+        print(f"    recall={h['effective_strength']:.2f}  type={h['type']}  level={h['level']}")
+
+
+def fts_query(raw: str) -> str:
+    """Turn a free-text query into a safe FTS5 OR-query of quoted tokens."""
+    tokens = re.findall(r"[A-Za-z0-9_]+", raw)
+    if not tokens:
+        return '""'
+    return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def cmd_get(args):
+    conn = connect()
+    rid = resolve_id(conn, args.id)
+    m = conn.execute("SELECT * FROM memories WHERE id=?", (rid,)).fetchone()
+    s = conn.execute("SELECT * FROM memory_state WHERE memory_id=?", (rid,)).fetchone()
+    out_edges = conn.execute(
+        "SELECT target_id, edge_type, weight FROM edges WHERE source_id=?", (rid,)).fetchall()
+    in_edges = conn.execute(
+        "SELECT source_id, edge_type, weight FROM edges WHERE target_id=?", (rid,)).fetchall()
+
+    if not args.no_reinforce:
+        log_access(conn, [rid], "fetch")
+        reinforce(conn, [rid], "fetch")
+        conn.commit()
+
+    if args.json:
+        print(json.dumps({
+            "memory": dict(m),
+            "state": dict(s) if s else None,
+            "edges_out": [dict(e) for e in out_edges],
+            "edges_in": [dict(e) for e in in_edges],
+        }, indent=2))
+        return
+    print(f"# {m['title']}")
+    print(f"id:    {m['id']}")
+    print(f"type:  {m['type']}   level: {m['level']}   scope: {m['scope'] or '-'}")
+    if s:
+        eff = effective_strength(s["strength"], s["half_life_days"], s["last_retrieved_at"])
+        print(f"state: strength={s['strength']:.3f} eff={eff:.3f} "
+              f"conf={s['confidence'] or '-'} retrievals={s['retrieval_count']}"
+              + (f" superseded_by={s['superseded_by']}" if s["superseded_by"] else ""))
+    print(f"source: {m['source'] or '-'}   updated: {m['updated_at']}")
+    if out_edges:
+        print("→ " + ", ".join(f"{e['edge_type']}:{e['target_id']}" for e in out_edges))
+    if in_edges:
+        print("← " + ", ".join(f"{e['source_id']}:{e['edge_type']}" for e in in_edges))
+    print()
+    print(m["body"])
+
+
+def cmd_link(args):
+    conn = connect()
+    if args.type not in VALID_EDGE_TYPES:
+        sys.exit(f"brain: invalid edge type '{args.type}' "
+                 f"(choose from {', '.join(VALID_EDGE_TYPES)})")
+    src = resolve_id(conn, args.source)
+    tgt = resolve_id(conn, args.target)
+    conn.execute(
+        "INSERT OR REPLACE INTO edges (source_id,target_id,edge_type,weight) VALUES (?,?,?,?)",
+        (src, tgt, args.type, args.weight))
+    conn.commit()
+    print(f"✅ {src} --{args.type}--> {tgt}")
+
+
+def cmd_traverse(args):
+    conn = connect()
+    start = resolve_id(conn, args.id)
+    seen, frontier, order = {start}, [(start, 0)], []
+    while frontier:
+        node, depth = frontier.pop(0)
+        order.append((node, depth))
+        if depth >= args.depth:
+            continue
+        for e in conn.execute(
+            "SELECT target_id, edge_type FROM edges WHERE source_id=? ORDER BY weight DESC",
+                (node,)).fetchall():
+            if e["target_id"] not in seen:
+                seen.add(e["target_id"])
+                frontier.append((e["target_id"], depth + 1))
+    ids = [n for n, _ in order]
+    if not args.no_reinforce:
+        log_access(conn, ids, "traverse")
+        reinforce(conn, ids, "traverse")
+        conn.commit()
+    for node, depth in order:
+        m = conn.execute("SELECT title, type FROM memories WHERE id=?", (node,)).fetchone()
+        title = m["title"] if m else "?"
+        print(f"{'  ' * depth}• {node}  ({m['type'] if m else '?'})  {title}")
+
+
+def cmd_supersede(args):
+    conn = connect()
+    old = resolve_id(conn, args.old)
+    new = resolve_id(conn, args.new)
+    conn.execute(
+        "UPDATE memory_state SET superseded_by=?, superseded_at=datetime('now'), "
+        "confidence='stale', updated_at=datetime('now') WHERE memory_id=?",
+        (new, old))
+    conn.execute(
+        "INSERT OR REPLACE INTO edges (source_id,target_id,edge_type,weight) "
+        "VALUES (?,?,'supersedes',1.5)", (new, old))
+    conn.commit()
+    print(f"✅ {new} supersedes {old} (old marked stale)")
+
+
+def cmd_confidence(args):
+    conn = connect()
+    if args.level not in VALID_CONFIDENCE:
+        sys.exit(f"brain: invalid confidence '{args.level}'")
+    rid = resolve_id(conn, args.id)
+    if not conn.execute("SELECT 1 FROM memory_state WHERE memory_id=?", (rid,)).fetchone():
+        sys.exit(f"brain: no memory_state for {rid}")
+    conn.execute("UPDATE memory_state SET confidence=?, updated_at=datetime('now') "
+                 "WHERE memory_id=?", (args.level, rid))
+    conn.commit()
+    print(f"✅ {rid} confidence = {args.level}")
+
+
+def cmd_forget(args):
+    conn = connect()
+    rid = resolve_id(conn, args.id)
+    conn.execute("UPDATE memories SET tombstone=1, updated_at=datetime('now') WHERE id=?",
+                 (rid,))
+    conn.commit()
+    print(f"✅ forgot (tombstoned) {rid}")
+
+
+def cmd_sleep(args):
+    conn = connect()
+    now = now_utc()
+    marked = 0
+    for r in conn.execute(
+        "SELECT memory_id, strength, half_life_days, last_retrieved_at "
+        "FROM memory_state WHERE confidence IS NOT 'stale' AND superseded_by IS NULL"
+    ).fetchall():
+        eff = effective_strength(r["strength"], r["half_life_days"],
+                                 r["last_retrieved_at"], now=now)
+        if eff <= STALE_THRESHOLD:
+            conn.execute("UPDATE memory_state SET confidence='stale', "
+                         "updated_at=datetime('now') WHERE memory_id=?", (r["memory_id"],))
+            marked += 1
+    pruned = conn.execute(
+        "DELETE FROM access_log WHERE accessed_at < datetime('now', ?)",
+        (f"-{ACCESS_LOG_RETENTION_DAYS} days",)).rowcount
+    conn.commit()
+    print(f"😴 sleep complete: {marked} memories marked stale, "
+          f"{pruned} access-log rows pruned (>{ACCESS_LOG_RETENTION_DAYS}d).")
+
+
+def cmd_stats(args):
+    conn = connect()
+    total = conn.execute("SELECT COUNT(*) c FROM memories WHERE tombstone=0").fetchone()["c"]
+    tomb = conn.execute("SELECT COUNT(*) c FROM memories WHERE tombstone=1").fetchone()["c"]
+    edges = conn.execute("SELECT COUNT(*) c FROM edges").fetchone()["c"]
+    print(f"Brain @ {db_path()}")
+    print(f"  memories: {total} active, {tomb} tombstoned   edges: {edges}")
+    print("  by level:")
+    for r in conn.execute("SELECT level, COUNT(*) c FROM memories WHERE tombstone=0 "
+                          "GROUP BY level ORDER BY c DESC").fetchall():
+        print(f"    {r['level']:<10} {r['c']}")
+    print("  by type:")
+    for r in conn.execute("SELECT type, COUNT(*) c FROM memories WHERE tombstone=0 "
+                          "GROUP BY type ORDER BY c DESC").fetchall():
+        print(f"    {r['type']:<10} {r['c']}")
+    stale = conn.execute("SELECT COUNT(*) c FROM memory_state WHERE confidence='stale'").fetchone()["c"]
+    sup = conn.execute("SELECT COUNT(*) c FROM memory_state WHERE superseded_by IS NOT NULL").fetchone()["c"]
+    print(f"  stale: {stale}   superseded: {sup}")
+
+
+def cmd_export(args):
+    conn = connect()
+    out = os.path.abspath(args.dir)
+    os.makedirs(out, exist_ok=True)
+    n = 0
+    for m in conn.execute("SELECT * FROM memories WHERE tombstone=0 ORDER BY id").fetchall():
+        rel = m["id"] + ".md"
+        path = os.path.join(out, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        s = conn.execute("SELECT * FROM memory_state WHERE memory_id=?", (m["id"],)).fetchone()
+        fm = [
+            "---",
+            f"id: {m['id']}",
+            f"type: {m['type']}",
+            f"level: {m['level']}",
+            f"scope: {m['scope'] or ''}",
+            f"confidence: {s['confidence'] if s and s['confidence'] else ''}",
+            f"updated: {m['updated_at']}",
+            "---",
+            "",
+            f"# {m['title']}",
+            "",
+            m["body"] or "",
+        ]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(fm))
+        n += 1
+    print(f"✅ exported {n} memories to {out}/  (markdown is a regenerable view; SQL remains source of truth)")
+
+
+def cmd_doctor(args):
+    conn = connect()
+    problems = []
+    ver = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if not ver or int(ver["value"]) != SCHEMA_VERSION:
+        problems.append(f"schema_version mismatch (db={ver['value'] if ver else '?'}, "
+                        f"cli={SCHEMA_VERSION}) — run `brain init` to migrate")
+    orphan_state = conn.execute(
+        "SELECT COUNT(*) c FROM memory_state s "
+        "LEFT JOIN memories m ON m.id=s.memory_id WHERE m.id IS NULL").fetchone()["c"]
+    if orphan_state:
+        problems.append(f"{orphan_state} orphaned memory_state rows")
+    missing_state = conn.execute(
+        "SELECT COUNT(*) c FROM memories m "
+        "LEFT JOIN memory_state s ON s.memory_id=m.id "
+        "WHERE s.memory_id IS NULL AND m.tombstone=0").fetchone()["c"]
+    if missing_state:
+        problems.append(f"{missing_state} active memories missing memory_state")
+    dangling = conn.execute(
+        "SELECT COUNT(*) c FROM edges e "
+        "LEFT JOIN memories a ON a.id=e.source_id "
+        "LEFT JOIN memories b ON b.id=e.target_id "
+        "WHERE a.id IS NULL OR b.id IS NULL").fetchone()["c"]
+    if dangling:
+        problems.append(f"{dangling} dangling edges")
+    integ = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    if integ != "ok":
+        problems.append(f"sqlite integrity_check: {integ}")
+
+    if problems:
+        print("⚠  brain doctor found issues:")
+        for p in problems:
+            print(f"   - {p}")
+        sys.exit(1)
+    print("✅ brain doctor: all checks passed")
+
+
+# --------------------------------------------------------------------------- #
+# Argument parsing
+# --------------------------------------------------------------------------- #
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="brain", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", help="create / migrate the database")
+    sp.add_argument("--owner", help="record an owner in meta")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("add", help="add a memory")
+    sp.add_argument("title")
+    sp.add_argument("--body", default="", help="body text, or '-' to read stdin")
+    sp.add_argument("--type", default="note", choices=VALID_TYPES)
+    sp.add_argument("--level", default="global", choices=VALID_LEVELS)
+    sp.add_argument("--scope", help="repo/project/domain name")
+    sp.add_argument("--source", help="provenance (session id, path, url, agent)")
+    sp.add_argument("--confidence", choices=VALID_CONFIDENCE)
+    sp.add_argument("--id", help="override the generated id")
+    sp.set_defaults(func=cmd_add)
+
+    sp = sub.add_parser("learn", help="add a '[CATEGORY] text' learning")
+    sp.add_argument("text")
+    sp.add_argument("--level", default="global", choices=VALID_LEVELS)
+    sp.add_argument("--scope")
+    sp.add_argument("--source")
+    sp.add_argument("--confidence", choices=VALID_CONFIDENCE)
+    sp.set_defaults(func=cmd_learn)
+
+    sp = sub.add_parser("search", help="full-text search, decay-blended ranking")
+    sp.add_argument("query")
+    sp.add_argument("--level", choices=VALID_LEVELS)
+    sp.add_argument("--type", choices=VALID_TYPES)
+    sp.add_argument("--scope")
+    sp.add_argument("--limit", type=int, default=10)
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--no-reinforce", action="store_true", help="do not bump strength")
+    sp.set_defaults(func=cmd_search)
+
+    sp = sub.add_parser("get", help="show one memory")
+    sp.add_argument("id")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--no-reinforce", action="store_true")
+    sp.set_defaults(func=cmd_get)
+
+    sp = sub.add_parser("link", help="create a typed edge")
+    sp.add_argument("source")
+    sp.add_argument("target")
+    sp.add_argument("--type", default="relates_to", choices=VALID_EDGE_TYPES)
+    sp.add_argument("--weight", type=float, default=1.0)
+    sp.set_defaults(func=cmd_link)
+
+    sp = sub.add_parser("traverse", help="walk the graph from a memory")
+    sp.add_argument("id")
+    sp.add_argument("--depth", type=int, default=2)
+    sp.add_argument("--no-reinforce", action="store_true")
+    sp.set_defaults(func=cmd_traverse)
+
+    sp = sub.add_parser("supersede", help="mark OLD superseded by NEW")
+    sp.add_argument("old")
+    sp.add_argument("new")
+    sp.set_defaults(func=cmd_supersede)
+
+    sp = sub.add_parser("confidence", help="set confidence level")
+    sp.add_argument("id")
+    sp.add_argument("level", choices=VALID_CONFIDENCE)
+    sp.set_defaults(func=cmd_confidence)
+
+    sp = sub.add_parser("forget", help="soft-delete (tombstone) a memory")
+    sp.add_argument("id")
+    sp.set_defaults(func=cmd_forget)
+
+    sp = sub.add_parser("sleep", help="housekeeping: mark stale + prune log")
+    sp.set_defaults(func=cmd_sleep)
+
+    sp = sub.add_parser("stats", help="database summary")
+    sp.set_defaults(func=cmd_stats)
+
+    sp = sub.add_parser("export", help="optional markdown export")
+    sp.add_argument("dir")
+    sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser("doctor", help="health / integrity check")
+    sp.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+# Embedded fallback schema (kept minimal; packaged sql/schema.sql is authoritative).
+EMBEDDED_SCHEMA = r"""
+-- ============================================================================
+-- Brain Memory Layer — Canonical Schema  (schema_version = 1)
+-- ============================================================================
+-- Source of truth: this SQLite database. Markdown vaults (if used) are an
+-- OPTIONAL, regenerable export — never authoritative.
+--
+-- Design: memory-first. A "memory" is a first-class durable record, not a
+-- mirror of a file. Each memory carries:
+--   * classification  (type + level + scope)
+--   * a recall model  (memory_state: strength, decay, confidence, supersession)
+--   * relationships   (edges)
+--   * usage telemetry (access_log)
+--
+-- Portable: SQLite + FTS5 only. No extensions, no external services.
+-- ============================================================================
+
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+-- ----------------------------------------------------------------------------
+-- meta: key-value store for schema version, owner, provenance.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- ----------------------------------------------------------------------------
+-- memories: one row per durable knowledge item.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS memories (
+    id            TEXT PRIMARY KEY,          -- stable slug or uuid (e.g. 'global/preference/concise-commits')
+    title         TEXT NOT NULL,
+    body          TEXT NOT NULL DEFAULT '',  -- markdown body; backs FTS + display
+
+    -- Classification ---------------------------------------------------------
+    type          TEXT NOT NULL DEFAULT 'note'
+                  CHECK (type IN ('note','learning','decision','pattern',
+                                  'gotcha','workflow','preference','tool','entity')),
+    level         TEXT NOT NULL DEFAULT 'global'
+                  CHECK (level IN ('repo','project','domain','global','tooling')),
+    scope         TEXT,                      -- repo/project/domain name; NULL for global/tooling
+
+    -- Provenance -------------------------------------------------------------
+    source        TEXT,                      -- session id, file path, url, agent name
+    content_hash  TEXT NOT NULL,             -- sha256 of title+body, for dedup/change detection
+
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    tombstone     INTEGER NOT NULL DEFAULT 0 -- 1 = soft-deleted, retained for history
+);
+
+CREATE INDEX IF NOT EXISTS idx_mem_type      ON memories(type);
+CREATE INDEX IF NOT EXISTS idx_mem_level      ON memories(level);
+CREATE INDEX IF NOT EXISTS idx_mem_scope      ON memories(scope);
+CREATE INDEX IF NOT EXISTS idx_mem_tombstone  ON memories(tombstone);
+CREATE INDEX IF NOT EXISTS idx_mem_hash       ON memories(content_hash);
+
+-- ----------------------------------------------------------------------------
+-- FTS5 full-text index over memories (replaces grep).
+-- External-content table kept in sync via triggers.
+-- ----------------------------------------------------------------------------
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    id, title, body, type, scope,
+    content='memories',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, id, title, body, type, scope)
+    VALUES (new.rowid, new.id, new.title, new.body, new.type, new.scope);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, body, type, scope)
+    VALUES ('delete', old.rowid, old.id, old.title, old.body, old.type, old.scope);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, body, type, scope)
+    VALUES ('delete', old.rowid, old.id, old.title, old.body, old.type, old.scope);
+    INSERT INTO memories_fts(rowid, id, title, body, type, scope)
+    VALUES (new.rowid, new.id, new.title, new.body, new.type, new.scope);
+END;
+
+-- ----------------------------------------------------------------------------
+-- memory_state: the recall model. Exponential-decay + reinforcement.
+-- One row per memory (created on insert). Hippo-memory inspired.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS memory_state (
+    memory_id         TEXT PRIMARY KEY
+                      REFERENCES memories(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    strength          REAL NOT NULL DEFAULT 1.0  CHECK (strength BETWEEN 0 AND 1),
+    half_life_days    REAL NOT NULL DEFAULT 7.0  CHECK (half_life_days > 0),
+    last_retrieved_at TEXT,
+    retrieval_count   INTEGER NOT NULL DEFAULT 0,
+    confidence        TEXT CHECK (confidence IS NULL OR confidence IN
+                                  ('verified','observed','inferred','stale')),
+    valence           TEXT NOT NULL DEFAULT 'neutral'
+                      CHECK (valence IN ('neutral','positive','negative')),
+    superseded_by     TEXT REFERENCES memories(id) ON UPDATE CASCADE,
+    superseded_at     TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_state_strength      ON memory_state(strength);
+CREATE INDEX IF NOT EXISTS idx_state_last_retrieved ON memory_state(last_retrieved_at);
+CREATE INDEX IF NOT EXISTS idx_state_confidence    ON memory_state(confidence) WHERE confidence IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_state_superseded    ON memory_state(superseded_by) WHERE superseded_by IS NOT NULL;
+
+-- ----------------------------------------------------------------------------
+-- edges: directed, typed relationships between memories.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS edges (
+    source_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    target_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    edge_type  TEXT NOT NULL DEFAULT 'relates_to'
+               CHECK (edge_type IN ('relates_to','depends_on','supersedes',
+                                     'derived_from','refines','contradicts')),
+    weight     REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (source_id, target_id, edge_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+CREATE INDEX IF NOT EXISTS idx_edges_type   ON edges(edge_type);
+
+-- ----------------------------------------------------------------------------
+-- access_log: append-only usage telemetry. Drives reinforcement + decay reset.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS access_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id   TEXT NOT NULL,
+    accessed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    source      TEXT CHECK (source IN ('search','traverse','fetch')),
+    query_hash  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_access_memory ON access_log(memory_id, accessed_at);
+CREATE INDEX IF NOT EXISTS idx_access_time   ON access_log(accessed_at);
+
+-- ----------------------------------------------------------------------------
+-- Seed schema version (idempotent).
+-- ----------------------------------------------------------------------------
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('created_at', datetime('now'));
+
+"""
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except sqlite3.Error as e:
+        sys.exit(f"brain: database error: {e}")
+
+
+if __name__ == "__main__":
+    main()
