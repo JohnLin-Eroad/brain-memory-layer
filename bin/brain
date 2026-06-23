@@ -24,6 +24,7 @@ Commands:
     sleep                         housekeeping: decay-mark stale + prune log
     stats                         database summary
     export DIR                    optional markdown export (vaults are optional)
+    dump                          full-fidelity JSONL export (sync contract)
     doctor                        health / integrity check
 
 Run `brain <command> -h` for per-command options.
@@ -560,6 +561,43 @@ def cmd_export(args):
     print(f"✅ exported {n} memories to {out}/  (markdown is a regenerable view; SQL remains source of truth)")
 
 
+def cmd_dump(args):
+    """Full-fidelity JSONL export: one object per memory (+ state + out-edges).
+
+    Read-only: performs only SELECTs, so it does NOT reinforce or mutate the
+    recall model. This is the machine sync contract (e.g. for a shared/cloud
+    brain); markdown `export` stays the human-readable view."""
+    conn = connect()
+    owner = conn.execute("SELECT value FROM meta WHERE key='owner'").fetchone()
+    dev_id = args.dev or (owner["value"] if owner else os.environ.get("USER", "unknown"))
+    exported_at = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+    where = "" if args.include_tombstoned else "WHERE m.tombstone = 0"
+    out = open(args.out, "w", encoding="utf-8") if args.out else sys.stdout
+    n = 0
+    try:
+        for m in conn.execute(f"SELECT * FROM memories m {where} ORDER BY m.id").fetchall():
+            s = conn.execute(
+                "SELECT strength, half_life_days, last_retrieved_at, retrieval_count, "
+                "confidence, valence, superseded_by, superseded_at "
+                "FROM memory_state WHERE memory_id=?", (m["id"],)).fetchone()
+            edges = conn.execute(
+                "SELECT target_id, edge_type, weight FROM edges WHERE source_id=? "
+                "ORDER BY target_id, edge_type", (m["id"],)).fetchall()
+            rec = dict(m)
+            rec["state"] = dict(s) if s else None
+            rec["edges_out"] = [dict(e) for e in edges]
+            rec["schema_version"] = SCHEMA_VERSION
+            rec["dev_id"] = dev_id
+            rec["exported_at"] = exported_at
+            out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            n += 1
+    finally:
+        if args.out:
+            out.close()
+    print(f"✅ dumped {n} memories for '{dev_id}'"
+          + (f" → {args.out}" if args.out else ""), file=sys.stderr)
+
+
 def cmd_doctor(args):
     conn = connect()
     problems = []
@@ -680,6 +718,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("export", help="optional markdown export")
     sp.add_argument("dir")
     sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser("dump", help="full-fidelity JSONL export (sync contract)")
+    sp.add_argument("--dev", help="developer id stamped on each record")
+    sp.add_argument("--out", help="output file (default: stdout)")
+    sp.add_argument("--include-tombstoned", action="store_true",
+                    help="also export soft-deleted memories")
+    sp.set_defaults(func=cmd_dump)
 
     sp = sub.add_parser("doctor", help="health / integrity check")
     sp.set_defaults(func=cmd_doctor)
