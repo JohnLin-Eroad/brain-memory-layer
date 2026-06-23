@@ -62,6 +62,7 @@ CPython). Verify any install with `brain doctor`.
 | `brain sleep` | daily housekeeping (decay-mark stale, prune log) |
 | `brain stats` / `brain doctor` | summary / health check |
 | `brain export DIR` | optional markdown view (SQL stays authoritative) |
+| `brain dump` | full-fidelity JSONL export (memory + state + edges); machine sync contract |
 
 Every command supports `-h`. Reads return `--json` for agents.
 

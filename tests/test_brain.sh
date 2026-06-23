@@ -49,6 +49,11 @@ check "stats"          "memories:"      <<< "$(b stats 2>&1)"
 
 EXPORT_DIR="$(dirname "$BRAIN_DB")/export"
 check "export"         "exported"       <<< "$(b export "$EXPORT_DIR" 2>&1)"
+
+check "dump jsonl"     '"edges_out"'         <<< "$(b dump 2>/dev/null)"
+check "dump dev stamp" '"dev_id": "tester"'  <<< "$(b dump 2>/dev/null)"
+check "dump read-only" "passed"              <<< "$(b dump >/dev/null 2>&1; b doctor 2>&1)"
+
 check "doctor (final)" "passed"         <<< "$(b doctor 2>&1)"
 
 # Ambiguity must fail loudly.
