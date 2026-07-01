@@ -128,4 +128,4 @@ pipelines. See [copilot/README.md](copilot/README.md).
 
 Run `tests/test_brain.sh` to confirm an install conforms to the spec.
 
-<!-- pr-finish smoke test: portabl memmory layer demo line -->
+<!-- pr-finish smoke test: portable memory layer demo line -->
