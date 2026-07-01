@@ -127,3 +127,5 @@ pipelines. See [copilot/README.md](copilot/README.md).
 - Out of scope for v1: shared/central store, network sync, multi-writer.
 
 Run `tests/test_brain.sh` to confirm an install conforms to the spec.
+
+<!-- pr-finish smoke test: portabl memmory layer demo line -->
